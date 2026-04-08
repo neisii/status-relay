@@ -17,12 +17,15 @@ pub enum Status {
 
 impl Status {
     fn from_raw(raw: &str) -> Self {
-        match raw {
-            "Operational" => Status::OPERATIONAL,
-            "Degraded Performance" => Status::DEGRADED,
-            "Partial Outage" => Status::OUTAGE,
-            "Major Outage" => Status::OUTAGE,
-            _ => Status::OUTAGE,
+        let lower = raw.to_lowercase();
+        if lower.contains("operational") {
+            Status::OPERATIONAL
+        } else if lower.contains("degraded") || lower.contains("minor") {
+            Status::DEGRADED
+        } else if lower.contains("outage") {
+            Status::OUTAGE
+        } else {
+            Status::OUTAGE
         }
     }
 
@@ -74,20 +77,42 @@ struct StatusPageStatus {
 }
 
 async fn fetch_status(url: &str) -> Result<Status, Box<dyn std::error::Error + Send + Sync>> {
-    let client = reqwest::Client::new();
-    let resp: StatusPageResponse = client.get(url).send().await?.json().await?;
-    Ok(Status::from_raw(&resp.status.description))
+    let client = reqwest::Client::builder().user_agent("Mozilla/5.0 StatusRelay").build()?;
+    let text = client.get(url).send().await?.text().await?;
+
+    if let Ok(resp) = serde_json::from_str::<StatusPageResponse>(&text) {
+        return Ok(Status::from_raw(&resp.status.description));
+    }
+
+    let lower = text.to_lowercase();
+    if lower.contains("all systems operational") || lower.contains("not aware of any issues") || lower.contains("all services are online") {
+        Ok(Status::OPERATIONAL)
+    } else if lower.contains("minor service outage") || lower.contains("degraded performance") || lower.contains("partially degraded") {
+        Ok(Status::DEGRADED)
+    } else if lower.contains("major outage") || lower.contains("partial outage") || lower.contains("critical outage") || lower.contains("partial system outage") || lower.contains("major system outage") {
+        Ok(Status::OUTAGE)
+    } else {
+        // Safe default to avoid false alarms when encountering unrecognized HTML, CDNs, or captchas
+        Ok(Status::OPERATIONAL)
+    }
 }
 
-const SERVICES: &[(&str, &str)] = &[
-    ("Claude", "https://status.claude.com/api/v2/status.json"),
-    ("Cloudflare", "https://www.cloudflarestatus.com/api/v2/status.json"),
+const SERVICES: &[(&str, &str, &str)] = &[
+    ("Claude", "https://status.claude.com/api/v2/status.json", "https://status.claude.com/"),
+    ("Cloudflare", "https://www.cloudflarestatus.com/api/v2/status.json", "https://www.cloudflarestatus.com/"),
+    ("Render", "https://status.render.com/api/v2/status.json", "https://status.render.com/"),
+    ("Replit", "https://status.replit.com/", "https://status.replit.com/"),
+    ("Supabase", "https://status.supabase.com/api/v2/status.json", "https://status.supabase.com/"),
+    ("Vercel", "https://www.vercel-status.com/api/v2/status.json", "https://www.vercel-status.com/"),
+    ("Netlify", "https://netlifystatus.com/api/v2/status.json", "https://netlifystatus.com/"),
+    ("Railway", "https://status.railway.app/", "https://status.railway.app/"),
+    ("Fly.io", "https://status.flyio.net/api/v2/status.json", "https://status.flyio.net/"),
 ];
 
 async fn poll_services(app: AppHandle) {
     let state = app.state::<Arc<AppState>>();
     
-    for (name, url) in SERVICES {
+    for (name, url, _) in SERVICES {
         match fetch_status(url).await {
             Ok(new_status) => {
                 let mut states = state.states.lock().await;
@@ -221,8 +246,12 @@ async fn update_tray_menu(app: &AppHandle) -> Result<(), Box<dyn std::error::Err
     }
 
     // Build menu
-    let claude_state = states.get("Claude").map(|s| s.status.clone()).unwrap_or(Status::OPERATIONAL);
-    let cf_state = states.get("Cloudflare").map(|s| s.status.clone()).unwrap_or(Status::OPERATIONAL);
+    let mut menu_items = Vec::new();
+    for (name, _, _) in SERVICES {
+        let state = states.get(*name).map(|s| s.status.clone()).unwrap_or(Status::OPERATIONAL);
+        let item = MenuItem::with_id(app, name.to_lowercase(), format!("{}: {}", name, state.to_icon()), true, None::<&str>)?;
+        menu_items.push(item);
+    }
     
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -233,19 +262,17 @@ async fn update_tray_menu(app: &AppHandle) -> Result<(), Box<dyn std::error::Err
     use chrono::{TimeZone, Local};
     let time_str = Local.timestamp_opt(now as i64, 0).unwrap().format("%H:%M:%S").to_string();
 
-    let claude_item = MenuItem::with_id(app, "claude", format!("Claude: {}", claude_state.to_icon()), false, None::<&str>)?;
-    let cf_item = MenuItem::with_id(app, "cloudflare", format!("Cloudflare: {}", cf_state.to_icon()), false, None::<&str>)?;
     let update_item = MenuItem::with_id(app, "update", format!("Last Updated: {}", time_str), false, None::<&str>)?;
     let refresh_item = MenuItem::with_id(app, "refresh", "Refresh", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
 
-    let menu = Menu::with_items(app, &[
-        &claude_item,
-        &cf_item,
-        &update_item,
-        &refresh_item,
-        &quit_item,
-    ])?;
+    let menu = Menu::new(app)?;
+    for item in &menu_items {
+        menu.append(item)?;
+    }
+    menu.append(&update_item)?;
+    menu.append(&refresh_item)?;
+    menu.append(&quit_item)?;
 
     if let Some(tray) = app.tray_by_id("main_tray") {
         let _ = tray.set_menu(Some(menu));
@@ -266,6 +293,7 @@ pub fn run() {
     });
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .manage(app_state.clone())
         .setup(|app| {
@@ -280,17 +308,22 @@ pub fn run() {
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
                 .on_menu_event(|app, event| {
-                    match event.id.as_ref() {
-                        "quit" => {
-                            app.exit(0);
+                    let id = event.id.as_ref();
+                    if id == "quit" {
+                        app.exit(0);
+                    } else if id == "refresh" {
+                        let handle = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            poll_services(handle).await;
+                        });
+                    } else {
+                        for (name, _, web_url) in SERVICES {
+                            if name.to_lowercase() == id {
+                                use tauri_plugin_opener::OpenerExt;
+                                let _ = app.opener().open_url(*web_url, None::<&str>);
+                                break;
+                            }
                         }
-                        "refresh" => {
-                            let handle = app.clone();
-                            tauri::async_runtime::spawn(async move {
-                                poll_services(handle).await;
-                            });
-                        }
-                        _ => {}
                     }
                 })
                 .build(app)?;
