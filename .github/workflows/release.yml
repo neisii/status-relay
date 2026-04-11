@@ -2,9 +2,8 @@ name: Release
 
 on:
   push:
-    branches:
-      - main
-  workflow_dispatch:
+    tags:
+      - "v*"
 
 jobs:
   publish:
@@ -13,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [macos-latest]
+        platform: [macos-latest, windows-latest]
 
     runs-on: ${{ matrix.platform }}
     env:
@@ -29,15 +28,20 @@ jobs:
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
+      - name: install create-dmg
+        if: matrix.platform == 'macos-latest'
+        run: brew install create-dmg
+
       - name: install frontend dependencies
         run: npm install
 
-      - uses: tauri-apps/tauri-action@v0
+      - name: build tauri app
+        run: npm run tauri build
+
+      - name: release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: src-tauri/target/release/bundle/**/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: v__VERSION__ # tauri-action replaces this with version from tauri.conf.json
-          releaseName: "StatusRelay v__VERSION__"
-          releaseBody: "Automated release of StatusRelay."
-          releaseDraft: false
-          prerelease: false
