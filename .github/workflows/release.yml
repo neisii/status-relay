@@ -9,14 +9,14 @@ jobs:
   publish:
     permissions:
       contents: write
+
     strategy:
       fail-fast: false
       matrix:
         platform: [macos-latest, windows-latest]
 
     runs-on: ${{ matrix.platform }}
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
     steps:
       - uses: actions/checkout@v4
 
@@ -28,7 +28,7 @@ jobs:
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
-      - name: install create-dmg
+      - name: install create-dmg (macOS)
         if: matrix.platform == 'macos-latest'
         run: brew install create-dmg
 
